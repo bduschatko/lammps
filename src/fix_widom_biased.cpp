@@ -1,7 +1,18 @@
-// clang-format off
-
 /* ----------------------------------------------------------------------
-   Contributing author: Evangelos Voyiatzis (Royal DSM)
+
+- Blake Duschatko
+
+- For energy calculations we don't need full system energy
+- Energy differences:
+
+    dU = U(N) - U(N+1)
+       = sum(intra molecule N) + sum(inter molecular N)
+         - sum(intra molecular N) - sum(intra molecular 1)
+         - sum(inter molecular N) - sum(inter molecular N+1)
+      = - ( sum(intra molecular 1) + sum(inter molecular N+1) )
+
+    Using full energy computes the intra-molecular 1 term
+
 ------------------------------------------------------------------------- */
 
 #include "fix_widom.h"
@@ -10,24 +21,25 @@
 #include "atom.h"
 #include "atom_vec.h"
 #include "bond.h"
-#include "comm.h"
-#include "compute.h"
+#include "comm.h" // MPI Communicator
+#include "compute.h" // Computes
 #include "dihedral.h"
 #include "domain.h"
 #include "error.h"
-#include "fix.h"
+#include "fix.h" // Fixes
+#include "fix_widom.h"
 #include "force.h"
-#include "group.h"
+#include "group.h" // Groups
 #include "improper.h"
 #include "kspace.h"
 #include "math_const.h"
-#include "math_extra.h"
+#include "math_extra.h" // Math Routines
 #include "memory.h"
 #include "modify.h"
-#include "molecule.h"
+#include "molecule.h" // Molecule Class
 #include "neighbor.h"
 #include "pair.h"
-#include "random_park.h"
+#include "random_park.h" // Random Numbers
 #include "region.h"
 #include "update.h"
 
@@ -41,119 +53,21 @@ using MathConst::MY_2PI;
 
 enum { EXCHATOM, EXCHMOL };    // exchmode
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Initialize Lammps Fix
+------------------------------------------------------------------------- */
+FixWidomBiased::FixWidomBiased(LAMMPS *lmp, int narg, char **arg) :
+    FixWidom::FixWidom(LAMMPS *lmp, int narg, char **arg){
 
-FixWidom::FixWidomBiased(LAMMPS *lmp, int narg, char **arg) :
-    Fix(lmp, narg, arg), region(nullptr), idregion(nullptr), full_flag(false), molcoords(nullptr),
-    molq(nullptr), molimage(nullptr), random_equal(nullptr), c_pe(nullptr)
-{
-  if (narg < 8) utils::missing_cmd_args(FLERR, "fix widom", error);
+      if (triclinic)
+        error->all(FLERR, "Fix widom/biased does not support triclinic cells");  
+      if (exchmode != EXCHMOL)
+        error->all(FLERR, "Fix widom/biased only supports molecule insertions");
 
-  if (atom->molecular == Atom::TEMPLATE)
-    error->all(FLERR, "Fix widom does not (yet) work with atom_style template");
+    };
 
-  dynamic_group_allow = 1;
-
-  vector_flag = 1;
-  size_vector = 3;
-  global_freq = 1;
-  extvector = 0;
-  restart_global = 1;
-  time_depend = 1;
-
-  triclinic = domain->triclinic;
-
-  // required args
-
-  nevery = utils::inumeric(FLERR,arg[3],false,lmp);
-  ninsertions = utils::inumeric(FLERR,arg[4],false,lmp);
-  nwidom_type = utils::inumeric(FLERR,arg[5],false,lmp);
-  seed = utils::inumeric(FLERR,arg[6],false,lmp);
-  insertion_temperature = utils::numeric(FLERR,arg[7],false,lmp);
-
-  if (nevery <= 0) error->all(FLERR,"Invalid fix widom every argument: {}", nevery);
-  if (ninsertions < 0) error->all(FLERR,"Invalid fix widom insertions argument: {}", ninsertions);
-  if (seed <= 0) error->all(FLERR,"Invalid fix widom seed argument: {}", seed);
-  if (insertion_temperature < 0.0)
-    error->all(FLERR,"Invalid fix widom temperature argument: {}", insertion_temperature);
-
-  // read options from end of input line
-
-  options(narg-8,&arg[8]);
-
-  // random number generator, same for all procs
-
-  random_equal = new RanPark(lmp,seed);
-
-  // error checks on region and its extent being inside simulation box
-
-  region_xlo = region_xhi = region_ylo = region_yhi = region_zlo = region_zhi = 0.0;
-  if (region) {
-    if (region->bboxflag == 0)
-      error->all(FLERR,"Fix widom region {} does not support a bounding box", region->id);
-    if (region->dynamic_check())
-      error->all(FLERR,"Fix widom region {} cannot be dynamic", region->id);
-
-    region_xlo = region->extent_xlo;
-    region_xhi = region->extent_xhi;
-    region_ylo = region->extent_ylo;
-    region_yhi = region->extent_yhi;
-    region_zlo = region->extent_zlo;
-    region_zhi = region->extent_zhi;
-
-    // estimate region volume using MC trials
-
-    double coord[3];
-    int inside = 0;
-    int attempts = 10000000;
-    for (int i = 0; i < attempts; i++) {
-      coord[0] = region_xlo + random_equal->uniform() * (region_xhi-region_xlo);
-      coord[1] = region_ylo + random_equal->uniform() * (region_yhi-region_ylo);
-      coord[2] = region_zlo + random_equal->uniform() * (region_zhi-region_zlo);
-      if (region->match(coord[0],coord[1],coord[2]) != 0)
-        inside++;
-    }
-
-    double max_region_volume = (region_xhi - region_xlo) * (region_yhi - region_ylo)
-      * (region_zhi - region_zlo);
-
-    region_volume = max_region_volume * static_cast<double>(inside) / static_cast<double>(attempts);
-  }
-
-  // error check and further setup for exchmode = EXCHMOL
-
-  if (exchmode == EXCHMOL) {
-    if (onemol->xflag == 0)
-      error->all(FLERR,"Fix widom molecule {} must have coordinates", onemol->id);
-    if (onemol->typeflag == 0)
-      error->all(FLERR,"Fix widom molecule {} must have atom types", onemol->id);
-    if (nwidom_type != 0)
-      error->all(FLERR,"Atom type must be zero in fix widom mol command");
-    if (onemol->qflag == 1 && atom->q == nullptr)
-      error->all(FLERR,"Fix widom molecule {} has charges, but atom style does not", onemol->id);
-
-    onemol->check_attributes();
-  }
-
-  if (charge_flag && atom->q == nullptr)
-    error->all(FLERR,"Fix widom atom has charge, but atom style does not");
-
-  // setup of array of coordinates for molecule insertion
-
-  if (exchmode == EXCHATOM) natoms_per_molecule = 1;
-  else natoms_per_molecule = onemol->natoms;
-  nmaxmolatoms = natoms_per_molecule;
-  grow_molecule_arrays(nmaxmolatoms);
-
-  // set up reneighboring
-
-  force_reneighbor = 1;
-  next_reneighbor = update->ntimestep + 1;
-
-  // zero out counters
-  widom_nmax = 0;
-  ave_widom_chemical_potential = 0.0;
-}
+void FixWidomBiased::init()
+{}
 
 /* ----------------------------------------------------------------------
    parse optional parameters at end of input line
@@ -163,60 +77,327 @@ void FixWidomBiased::options(int narg, char **arg)
 {
   if (narg < 0) error->all(FLERR,"Illegal fix widom/biased command");
 
-  // defaults
-
-  exchmode = EXCHATOM;
-  region_volume = 0;
-  max_region_attempts = 1000;
-  molecule_group = 0;
-  molecule_group_bit = 0;
-  molecule_group_inversebit = 0;
-  exclusion_group = 0;
-  exclusion_group_bit = 0;
-  charge = 0.0;
-  charge_flag = false;
-  full_flag = false;
-  energy_intra = 0.0;
-
-  int iarg = 0;
+  // Set up volume biasing and remove from args for parent class
+  int iarg, iarg_reduced = 0;
+  char reduced_arg[narg-2];
   while (iarg < narg) {
-    if (strcmp(arg[iarg],"mol") == 0) {
-      if (iarg+2 > narg) utils::missing_cmd_args(FLERR, "fix widom mol", error);
-      auto onemols = atom->get_molecule_by_id(arg[iarg+1]);
-      if (onemols.size() == 0)
-        error->all(FLERR,"Molecule template ID {} for fix widom does not exist", arg[iarg+1]);
-      if (onemols.size() > 1 && comm->me == 0)
-        error->warning(FLERR,"Molecule template {} for fix widom has multiple molecules; "
-                       "will use only the first molecule", arg[iarg+1]);
-      exchmode = EXCHMOL;
-      onemol = onemols[0];
+    if (strcmp(arg[iarg],"volume") == 0) {
+      if (iarg+1 > narg)
+        error->all(FLERR, "Illegal fix widom/biased command");
+      read_volumes(arg[iarg+1])
       iarg += 2;
-    } 
-      
-      else if (strcmp(arg[iarg], "volumes") == 0) {
-      this->read_volumes(arg[iarg]);
-        
-    } else if (strcmp(arg[iarg],"region") == 0) {
-      if (iarg+2 > narg) error->all(FLERR,"Illegal fix widom command");
-      region = domain->get_region_by_id(arg[iarg+1]);
-      if (!region) error->all(FLERR,"Region {} for fix widom does not exist",arg[iarg+1]);
-      idregion = utils::strdup(arg[iarg+1]);
-      iarg += 2;
-    } else if (strcmp(arg[iarg],"charge") == 0) {
-      if (iarg+2 > narg) error->all(FLERR,"Illegal fix widom command");
-      charge = utils::numeric(FLERR,arg[iarg+1],false,lmp);
-      charge_flag = true;
-      iarg += 2;
-    } else if (strcmp(arg[iarg],"full_energy") == 0) {
-      full_flag = true;
-      iarg += 1;
-    } else if (strcmp(arg[iarg],"intra_energy") == 0) {
-      if (iarg+2 > narg) error->all(FLERR,"Illegal fix widom command");
-      energy_intra = utils::numeric(FLERR,arg[iarg+1],false,lmp);
-      iarg += 2;
-    } else error->all(FLERR,"Illegal fix widom command");
+    }
+    else
+      reduced_arg[iarg_reduced] = arg[iarg]
+      iarg_reduced += 1;
   }
+
+  // call parent without volume info 
+  FixWidom::options(narg-2, reduced_arg);
+
 }
 
-void FixWidomBiased::read_volumes(file){
+void FixWidomBiased::read_volumes(char *filename){
+  int me = comm->me;
+  char line[MAXLINE];
+  FILE *fptr;
+  char *ptr;
+
+  // Read file on process 0
+  if (me = 0){
+    fpt = utils::open_potential(filename, lmp, nullptr) // Where is open potential ?
+    if (fptr == NULL) {
+      char str[128];
+      snprintf(str, 128, "Cannot open volumes file %s", filename)
+      error->one(FLERR, str);
+    }
+  }
+
+  int nvols, ncols; 
+
+  if (me == 0){
+
+    // Read up to MAXLINES from file stream, until a new line is reached
+    fgets(line, MAXLINE, fptr); 
+
+    // Get number of volumes and column size
+    sccanf(line, "%i %i", &nvols, &ncols)
+
+    // Create buffer for file
+    int buffer_size = nvols*ncols;
+    memory->create(volume_buffer, buffer_size, "fix:buffer")
+
+    for (int i=0; i < nvols; i++){
+      fgets(line, MAXLINE, fptr); 
+      ptr = strtok(line, " \t\n\r\f");
+      volume_buffer[i] = atof(ptr)
+      while ((ptr = strtok(NULL, " \t\n\r\f")))
+        volume_buffer[i++] = atof(ptr);
+    }
+
+  }
+
+  // Broadcast buffer
+  MPI_Bcast(&volumes, , MPI_INT, 0, world)
+
+  // Locally reshape buffer 
+  volumes = Eigen::MatrixXd::Zero(nvols, ncols);
+  for (int i = 0; i < nvols; i++){
+      for (int j = 0; j < ncols; j++){
+          volumes[i,j] = volume_buffer[i*ncols + j]
+      }
+  }
+
+}
+
+/* ----------------------------------------------------------------------
+   Memory Management 
+------------------------------------------------------------------------- */
+
+FixWidomBiased::~FixWidomBiased():
+  FixWidom::~FixWidom()
+{
+  memory->destroy(volume_buffer); 
+}
+
+/* ----------------------------------------------------------------------
+   Insertion Routines
+------------------------------------------------------------------------- */
+  
+  // Allegro is special case
+  // This would normally compute pair interactions one at a time 
+  // Allegro better if we parallel
+
+  void FixWidomBiased::attempt_molecule_insertion(){
+    /*
+     * Perform a molecule insertion and compute pair energy
+     * Single point energy computations, no need to create atoms
+     */
+
+    // Randomly Sample Volume and Get Center
+    int volid; // ID
+    double size = volumes[volid][4];
+
+    double com_coord[3];
+    com_coord[0] = volumes[volid][0] + random_equal->uniform() * size;
+    com_coord[1] = volumes[volid][1] + random_equal->uniform() * size;
+    com_coord[2] = volumes[volid][2] + random_equal->uniform() * size;
+
+    // Create a Rotation Matrix for Molecule Orientation
+    // --------------------------------------------
+    double r[3],rotmat[3][3],quat[4];
+    double rsq = 1.1;
+    while (rsq > 1.0) {
+      r[0] = 2.0*random_equal->uniform() - 1.0;
+      r[1] = 2.0*random_equal->uniform() - 1.0;
+      r[2] = 2.0*random_equal->uniform() - 1.0;
+      rsq = MathExtra::dot3(r, r);
+    }
+    double theta = random_equal->uniform() * MY_2PI;
+    MathExtra::norm3(r);
+    MathExtra::axisangle_to_quat(r,theta,quat);
+    MathExtra::quat_to_mat(quat,rotmat);
+    // --------------------------------------------
+
+    // Place Each Atom in Molecule
+    for (int i = 0; i < natoms_per_molecule; i++) {
+
+      // Rotate Molecule Orientation Vector
+      MathExtra::matvec(rotmat,onemol->x[i],xtmp);
+
+      double xtmp[3];
+      xtmp[0] += com_coord[0];
+      xtmp[1] += com_coord[1];
+      xtmp[2] += com_coord[2];
+
+      // Remap into Domain
+      imageint imagetmp = imagezero;
+      domain->remap(xtmp,imagetmp);
+      if (!domain->inside(xtmp))
+        error->one(FLERR,"Fix widom put atom outside box");
+
+      // Only Create Atom in the Right Subdomain
+      int proc_flag = 0;
+
+      if (proc_flag) {
+        int ii = -1;
+        if (charge_flag) {
+          ii = atom->nlocal + atom->nghost;
+          if (ii >= atom->nmax) atom->avec->grow(0);
+          atom->q[ii] = charge;
+        }
+        double insertion_energy = energy(ii,nwidom_type,-1,coord);
+        double inst_chem_pot = exp(-insertion_energy*beta);
+        double incr_chem_pot = (inst_chem_pot - ave_widom_chemical_potential);
+        ave_widom_chemical_potential += incr_chem_pot / (imove + 1);
+      }
+
+    }
+  }
+
+
+  void FixWidomBiased::attempt_molecule_insertion_full(){
+    /*
+     * Perform a molecule insertion and compute full energy
+     */
+
+    double lamda[3];
+
+    // Create new molecule tag
+    tagint maxmol = 0;
+
+    // Determine current max molecule tag in system
+    // Loop over atoms local to process 
+    for (int i = 0; i < atom->nlocal; i++) maxmol = MAX(maxmol,atom->molecule[i]);
+
+    // Collect maxmol tags from all processes 
+    tagint maxmol_all;
+    MPI_Allreduce(&maxmol,&maxmol_all,1,MPI_LMP_TAGINT,MPI_MAX,world);
+
+    // Increment maxmol tag 
+    maxmol_all++;
+    if (maxmol_all >= MAXTAGINT)
+      error->all(FLERR,"Fix widom ran out of available molecule IDs");
+    int insertion_molecule = maxmol_all;
+
+    // Repeat checks for atom number tags
+    tagint maxtag = 0;
+    for (int i = 0; i < atom->nlocal; i++) maxtag = MAX(maxtag,atom->tag[i]);
+    tagint maxtag_all;
+    MPI_Allreduce(&maxtag,&maxtag_all,1,MPI_LMP_TAGINT,MPI_MAX,world);
+
+    // Randomly Sample Volume and Get Center
+    int volid; // ID
+    double size = volumes[volid][4];
+
+    double com_coord[3];
+    com_coord[0] = volumes[volid][0] + random_equal->uniform() * size;
+    com_coord[1] = volumes[volid][1] + random_equal->uniform() * size;
+    com_coord[2] = volumes[volid][2] + random_equal->uniform() * size;
+
+    // Create a Rotation Matrix for Molecule Orientation
+    // --------------------------------------------
+    double r[3],rotmat[3][3],quat[4];
+    double rsq = 1.1;
+    while (rsq > 1.0) {
+      r[0] = 2.0*random_equal->uniform() - 1.0;
+      r[1] = 2.0*random_equal->uniform() - 1.0;
+      r[2] = 2.0*random_equal->uniform() - 1.0;
+      rsq = MathExtra::dot3(r, r);
+    }
+    double theta = random_equal->uniform() * MY_2PI;
+    MathExtra::norm3(r);
+    MathExtra::axisangle_to_quat(r,theta,quat);
+    MathExtra::quat_to_mat(quat,rotmat);
+    // --------------------------------------------
+
+    // Place Each Atom in Molecule
+    for (int i = 0; i < natoms_per_molecule; i++) {
+
+      // Rotate Molecule Orientation Vector
+      MathExtra::matvec(rotmat,onemol->x[i],xtmp);
+
+      double xtmp[3];
+      xtmp[0] += com_coord[0];
+      xtmp[1] += com_coord[1];
+      xtmp[2] += com_coord[2];
+
+      // Remap into Domain
+      imageint imagetmp = imagezero;
+      domain->remap(xtmp,imagetmp);
+      if (!domain->inside(xtmp))
+        error->one(FLERR,"Fix widom put atom outside box");
+
+      // Only Create Atom in the Right Subdomain
+      int proc_flag = 0;
+      if (triclinic == 0) {
+        if (xtmp[0] >= sublo[0] && xtmp[0] < subhi[0] &&
+            xtmp[1] >= sublo[1] && xtmp[1] < subhi[1] &&
+            xtmp[2] >= sublo[2] && xtmp[2] < subhi[2]) 
+            proc_flag = 1; // Atom DOES belong to subdomain of this process
+      } else {
+        domain->x2lamda(xtmp,lamda);
+        if (lamda[0] >= sublo[0] && lamda[0] < subhi[0] &&
+            lamda[1] >= sublo[1] && lamda[1] < subhi[1] &&
+            lamda[2] >= sublo[2] && lamda[2] < subhi[2]) proc_flag = 1;
+      }
+
+        // If the atom belongs to this subdomain, add it
+        if (proc_flag) {
+
+          atom->avec->create_atom(onemol->type[i],xtmp);
+          int m = atom->nlocal - 1;
+
+          atom->image[m] = imagetmp;
+          atom->molecule[m] = insertion_molecule;
+          if (maxtag_all+i+1 >= MAXTAGINT)
+            error->all(FLERR,"Fix widom ran out of available atom IDs");
+          atom->tag[m] = maxtag_all + i + 1;
+          atom->v[m][0] = 0;
+          atom->v[m][1] = 0;
+          atom->v[m][2] = 0;
+
+          atom->add_molecule_atom(onemol,i,m,maxtag_all);
+          modify->create_attribute(m);
+      }
+
+    }
+
+    // Update Global Attributes
+    atom->natoms += natoms_per_molecule;
+    if (atom->natoms < 0) error->all(FLERR,"Too many total atoms");
+    atom->nbonds += onemol->nbonds;
+    atom->nangles += onemol->nangles;
+    atom->ndihedrals += onemol->ndihedrals;
+    atom->nimpropers += onemol->nimpropers;
+    if (atom->map_style != Atom::MAP_NONE) atom->map_init();
+    atom->nghost = 0;
+    if (triclinic) domain->x2lamda(atom->nlocal);
+    comm->borders();
+    if (triclinic) domain->lamda2x(atom->nlocal+atom->nghost);
+    if (force->kspace) force->kspace->qsum_qsq();
+    if (force->pair->tail_flag) force->pair->reinit();
+
+    // energy_after corrected by energy_intra
+    // WARNING do NOT include intra-molecular energies
+    double insertion_energy = (energy_full() -energy_intra) - energy_stored;
+    double inst_chem_pot = exp(-insertion_energy*beta);
+    double incr_chem_pot = (inst_chem_pot - ave_widom_chemical_potential);
+    ave_widom_chemical_potential += incr_chem_pot / (imove + 1);
+
+    // Remove atoms when done
+    atom->nbonds -= onemol->nbonds;
+    atom->nangles -= onemol->nangles;
+    atom->ndihedrals -= onemol->ndihedrals;
+    atom->nimpropers -= onemol->nimpropers;
+    atom->natoms -= natoms_per_molecule;
+
+    int i = 0;
+    while (i < atom->nlocal) {
+      if (atom->molecule[i] == insertion_molecule) {
+        atom->avec->copy(atom->nlocal-1,i,1);
+        atom->nlocal--;
+      } else i++;
+    }
+    if (force->kspace) force->kspace->qsum_qsq();
+    if (force->pair->tail_flag) force->pair->reinit();
+
+  };
+
+
+/* ----------------------------------------------------------------------
+   Energy Routines
+------------------------------------------------------------------------- */
+  
+double FixWidomBiased::energy(int i, int itype, tagint imolecule, double *coord)
+{
+  if strmtch(lmp->pair_style, "allegro")
+    error->all(FLERR, "Allegro not yet supported for Widom insertion");
+  else if strmtch(lmp->pair_style, "allegro64")
+    error->all(FLERR, "Allegro not yet supported for Widom insertion");
+  else
+    return FixWidom::energy(int i, int itype, tagint imolecule, double *coord);
+
+}
+
 }

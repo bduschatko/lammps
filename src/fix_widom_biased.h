@@ -1,9 +1,14 @@
 /* -*- c++ -*- ----------------------------------------------------------
+
+Widom insertion routine with sample biasing to system voids 
+
+- Blake Duschatko
+
 ------------------------------------------------------------------------- */
 
 #ifdef FIX_CLASS
 // clang-format off
-FixStyle(widom,FixWidomBiased);
+FixStyle(widom/biased,FixWidomBiased);
 // clang-format on
 #else
 
@@ -11,83 +16,40 @@ FixStyle(widom,FixWidomBiased);
 #define LMP_FIX_WIDOM_BIASED_H
 
 #include "fix.h"
+#include "fix_widom.h"
 
 namespace LAMMPS_NS {
 
-class FixWidomBiased : public Fix {
+class FixWidomBiased : public FixWidom {
  public:
+
   FixWidomBiased(class LAMMPS *, int, char **);
   ~FixWidomBiased() override;
 
-  int setmask() override;
-  void init() override;
-  void pre_exchange() override;
+  // Adapted Methods
 
-  // void attempt_atomic_insertion();
+  void options(int narg, char **arg);
+  double energy(int i, int itype, tagint imolecule, double *coord);
+
+  // Pair Style ONLY Insertions
+  //void attempt_atomic_insertion();
   void attempt_molecule_insertion();
 
+  // FULL Energy Insertions 
   //void attempt_atomic_insertion_full();
   void attempt_molecule_insertion_full();
-  double energy(int, int, tagint, double *);
-  double molecule_energy(tagint);
-  double energy_full();
-  double compute_vector(int) override;
-  double memory_usage() override;
-  void write_restart(FILE *) override;
-  void restart(char *) override;
-  void grow_molecule_arrays(int);
+
+  // Custom Method
+
+  void read_volumes(char *filename);
 
  private:
-  int molecule_group, molecule_group_bit;
-  int molecule_group_inversebit;
-  int exclusion_group, exclusion_group_bit;
-  int nwidom_type, nevery, seed;
-  int ninsertions;
-  //int exchmode;            // exchange ATOM or MOLECULE
-  //class Region *region;    // widom region
-  //char *idregion;          // widom region id
-  bool charge_flag;        // true if user specified atomic charge
-  bool full_flag;          // true if doing full system energy calculations
 
-  int natoms_per_molecule;    // number of atoms in each inserted molecule
-  int nmaxmolatoms;           // number of atoms allocated for molecule arrays
-
-  double ave_widom_chemical_potential;
-
-  int widom_nmax;
-  int max_region_attempts;
-  double gas_mass;
-  double insertion_temperature;
-  double beta, volume;
-  double charge;
-  double xlo, xhi, ylo, yhi, zlo, zhi;
-  double region_xlo, region_xhi, region_ylo, region_yhi, region_zlo, region_zhi;
-  double region_volume;
-  double energy_stored;    // full energy of old/current configuration
-  double *sublo, *subhi;
-  double **cutsq;
-  double **molcoords;
-  double *molq;
-  imageint *molimage;
-  imageint imagezero;
-
-  double energy_intra;
-
-  class Pair *pair;
-
-  class RanPark *random_equal;
-
-  class Atom *model_atom;
-
-  class Molecule *onemol;
-  int triclinic;    // 0 = orthog box, 1 = triclinic
-
-  class Compute *c_pe;
-
-  void options(int, char **);
+  // Array of volume centers and size 
+  const Eigen::MatrixXd volumes;
+  
 };
 
-}    // namespace LAMMPS_NS
-
+}   
 #endif
 #endif
