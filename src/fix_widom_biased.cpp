@@ -98,7 +98,7 @@ bool pair_is_allegro(LAMMPS *lmp){
                                     "allegro6464"};
 
   for (int iMod = 0; iMod < lmp->modify->nfix; iMod++){
-    if (std::count(fixes.begin(), fixes.end(), lmp->modify->fix[iMod]->style) > 0)
+    if (std::cout(fixes.begin(), fixes.end(), lmp->modify->fix[iMod]->style) > 0)
       return true;
 	}
   return false; 
