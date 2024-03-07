@@ -39,6 +39,7 @@
 #include <exception>
 #include <stdio.h>
 #include <iostream> // debugging
+#include <algorithm>
 
 // check if allegro is built
 #ifdef LMP_PAIR_ALLEGRO_H
@@ -98,7 +99,7 @@ bool pair_is_allegro(LAMMPS *lmp){
                                     "allegro6464"};
 
   for (int iMod = 0; iMod < lmp->modify->nfix; iMod++){
-    if (std::cout(fixes.begin(), fixes.end(), lmp->modify->fix[iMod]->style) > 0)
+    if (std::count(fixes.begin(), fixes.end(), lmp->modify->fix[iMod]->style) > 0)
       return true;
 	}
   return false; 
