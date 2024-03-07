@@ -46,6 +46,7 @@
 #include <cmath>
 #include <cstring>
 #include <exception>
+#include <iostream>
 
 using namespace LAMMPS_NS;
 using namespace FixConst;
@@ -173,6 +174,7 @@ FixWidom::FixWidom(LAMMPS *lmp, int narg, char **arg) :
 
 void FixWidom::options(int narg, char **arg)
 {
+
   if (narg < 0) error->all(FLERR,"Illegal fix widom command");
 
   // defaults
@@ -281,6 +283,7 @@ int FixWidom::setmask()
 
 void FixWidom::init()
 {
+
   if (!atom->mass) error->all(FLERR, "Fix widom requires per atom type masses");
   if (atom->rmass_flag && (comm->me == 0))
     error->warning(FLERR, "Fix widom will use per atom type masses for velocity initialization");
@@ -389,6 +392,7 @@ void FixWidom::init()
     neighbor->modify_params(fmt::format("exclude group {} all",group_id));
   }
 
+
   // create a new group for temporary use with selected molecules
 
   if (exchmode == EXCHMOL) {
@@ -492,6 +496,7 @@ void FixWidom::pre_exchange()
   if (triclinic) domain->lamda2x(atom->nlocal+atom->nghost);
 
   if (full_flag) {
+    
     energy_stored = energy_full();
 
     if (exchmode == EXCHATOM) {
@@ -517,6 +522,7 @@ void FixWidom::pre_exchange()
 
   }
   next_reneighbor = update->ntimestep + nevery;
+
 }
 
 /* ----------------------------------------------------------------------
@@ -1005,9 +1011,11 @@ double FixWidom::energy(int i, int itype, tagint imolecule, double *coord)
     rsq = delx*delx + dely*dely + delz*delz;
     int jtype = type[j];
 
+
     if (rsq < cutsq[itype][jtype])
       total_energy +=
         pair->single(i,j,itype,jtype,rsq,factor_coul,factor_lj,fpair);
+
   }
 
   return total_energy;

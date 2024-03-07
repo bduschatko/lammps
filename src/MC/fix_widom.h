@@ -46,7 +46,7 @@ class FixWidom : public Fix {
   void restart(char *) override;
   void grow_molecule_arrays(int);
 
- private:
+ protected:
   int molecule_group, molecule_group_bit;
   int molecule_group_inversebit;
   int exclusion_group, exclusion_group_bit;
