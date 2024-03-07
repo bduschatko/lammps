@@ -297,8 +297,6 @@ void FixWidomBiased::pre_exchange(){
 
   if (next_reneighbor != update->ntimestep) return;
 
-  std::cout << "STEPS " << next_reneighbor << " " << update->ntimestep << "\n";
-
   xlo = domain->boxlo[0];
   xhi = domain->boxhi[0];
   ylo = domain->boxlo[1];
